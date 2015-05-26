@@ -23,25 +23,23 @@
 #define serial_h
 
 
-#ifndef RX_BUFFER_SIZE
-  #define RX_BUFFER_SIZE 128
-#endif
-#ifndef TX_BUFFER_SIZE
-  #define TX_BUFFER_SIZE 64
+
+#ifndef		MASK
+/// MASKING- returns \f$2^PIN\f$
+	#define		MASK(PIN)				(1 << PIN)
 #endif
 
 #define SERIAL_NO_DATA 0xff
 
-#ifdef ENABLE_XONXOFF
-  #define RX_BUFFER_FULL 96 // XOFF high watermark
-  #define RX_BUFFER_LOW 64 // XON low watermark
-  #define SEND_XOFF 1
-  #define SEND_XON 2
-  #define XOFF_SENT 3
-  #define XON_SENT 4
-  #define XOFF_CHAR 0x13
-  #define XON_CHAR 0x11
-#endif
+#ifdef USB_SERIAL
+  #include "usb_serial.h"
+  #define serial_init() usb_init()
+  #define serial_get_rx_buffer_count() usb_serial_available()
+  #define serial_read() usb_serial_getchar()
+  #define serial_write(c) usb_serial_putchar(c)
+  #define serial_reset_read_buffer() usb_serial_flush_input()
+  #define serial_get_tx_buffer_count() 0
+#else
 
 void serial_init();
 
@@ -61,4 +59,6 @@ uint8_t serial_get_rx_buffer_count();
 // NOTE: Not used except for debugging and ensuring no TX bottlenecks.
 uint8_t serial_get_tx_buffer_count();
 
+
+#endif //USB_SERIAL
 #endif

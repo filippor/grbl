@@ -33,6 +33,10 @@
   #include "cpu_map/cpu_map_atmega328p.h"
 #endif
 
+#ifdef CPU_MAP_ATMEGA32u4 // (Arduino Uno) Officially supported by Grbl.
+  #include "cpu_map/cpu_map_atmega32u4.h"
+#endif
+
 #ifdef CPU_MAP_ATMEGA2560 // (Arduino Mega 2560) Working @EliteEng
   #include "cpu_map/cpu_map_atmega2560.h"
 #endif

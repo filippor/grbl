@@ -1,201 +1,273 @@
-/*
-  serial.c - Low level functions for sending and recieving bytes via the serial port
-  Part of Grbl
-
-  Copyright (c) 2011-2015 Sungeun K. Jeon
-  Copyright (c) 2009-2011 Simen Svale Skogsrud
-
-  Grbl is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
-
-  Grbl is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
-*/
-
 #include "grbl.h"
 
+/** \file
+	\brief Serial subsystem
 
-uint8_t serial_rx_buffer[RX_BUFFER_SIZE];
-uint8_t serial_rx_buffer_head = 0;
-volatile uint8_t serial_rx_buffer_tail = 0;
+	Teacup's serial subsystem is a powerful, thoroughly tested and highly modular serial management system.
 
-uint8_t serial_tx_buffer[TX_BUFFER_SIZE];
-uint8_t serial_tx_buffer_head = 0;
-volatile uint8_t serial_tx_buffer_tail = 0;
+	It uses ringbuffers for both transmit and receive, and intelligently decides whether to wait or drop transmitted characters if the buffer is full.
 
+	It also supports XON/XOFF flow control of the receive buffer, to help avoid overruns.
+*/
 
-#ifdef ENABLE_XONXOFF
-  volatile uint8_t flow_ctrl = XON_SENT; // Flow control state variable
+#include	<avr/interrupt.h>
+#include	"memory_barrier.h"
+
+//#include	"arduino.h"
+
+/// size of TX and RX buffers. MUST be a \f$2^n\f$ value
+#define		BUFSIZE			64
+
+/// ascii XOFF character
+#define		ASCII_XOFF	19
+/// ascii XON character
+#define		ASCII_XON		17
+
+#ifndef USB_SERIAL
+/// rx buffer head pointer. Points to next available space.
+volatile uint8_t rxhead = 0;
+/// rx buffer tail pointer. Points to last character in buffer
+volatile uint8_t rxtail = 0;
+/// rx buffer
+volatile uint8_t rxbuf[BUFSIZE];
+
+/// tx buffer head pointer. Points to next available space.
+volatile uint8_t txhead = 0;
+/// tx buffer tail pointer. Points to last character in buffer
+volatile uint8_t txtail = 0;
+/// tx buffer
+volatile uint8_t txbuf[BUFSIZE];
+
+/// check if we can read from this buffer
+#define	buf_canread(buffer)			((buffer ## head - buffer ## tail    ) & (BUFSIZE - 1))
+/// read from buffer
+#define	buf_pop(buffer, data)		do { data = buffer ## buf[buffer ## tail]; buffer ## tail = (buffer ## tail + 1) & (BUFSIZE - 1); } while (0)
+
+/// check if we can write to this buffer
+#define	buf_canwrite(buffer)		((buffer ## tail - buffer ## head - 1) & (BUFSIZE - 1))
+/// write to buffer
+#define	buf_push(buffer, data)	do { buffer ## buf[buffer ## head] = data; buffer ## head = (buffer ## head + 1) & (BUFSIZE - 1); } while (0)
+
+/*
+	ringbuffer logic:
+	head = written data pointer
+	tail = read data pointer
+
+	when head == tail, buffer is empty
+	when head + 1 == tail, buffer is full
+	thus, number of available spaces in buffer is (tail - head) & bufsize
+
+	can write:
+	(tail - head - 1) & (BUFSIZE - 1)
+
+	write to buffer:
+	buf[head++] = data; head &= (BUFSIZE - 1);
+
+	can read:
+	(head - tail) & (BUFSIZE - 1)
+
+	read from buffer:
+	data = buf[tail++]; tail &= (BUFSIZE - 1);
+*/
+
+#ifdef	XONXOFF
+#define		FLOWFLAG_STATE_XOFF	0
+#define		FLOWFLAG_SEND_XON		1
+#define		FLOWFLAG_SEND_XOFF	2
+#define		FLOWFLAG_STATE_XON	4
+// initially, send an XON
+volatile uint8_t flowflags = FLOWFLAG_SEND_XON;
 #endif
-  
 
-// Returns the number of bytes used in the RX serial buffer.
-uint8_t serial_get_rx_buffer_count()
-{
-  uint8_t rtail = serial_rx_buffer_tail; // Copy to limit multiple calls to volatile
-  if (serial_rx_buffer_head >= rtail) { return(serial_rx_buffer_head-rtail); }
-  return (RX_BUFFER_SIZE - (rtail-serial_rx_buffer_head));
-}
-
-
-// Returns the number of bytes used in the TX serial buffer.
-// NOTE: Not used except for debugging and ensuring no TX bottlenecks.
-uint8_t serial_get_tx_buffer_count()
-{
-  uint8_t ttail = serial_tx_buffer_tail; // Copy to limit multiple calls to volatile
-  if (serial_tx_buffer_head >= ttail) { return(serial_tx_buffer_head-ttail); }
-  return (TX_BUFFER_SIZE - (ttail-serial_tx_buffer_head));
-}
-
-
+/// initialise serial subsystem
+///
+/// set up baud generator and interrupts, clear buffers
 void serial_init()
 {
-  // Set baud rate
-  #if BAUD_RATE < 57600
-    uint16_t UBRR0_value = ((F_CPU / (8L * BAUD_RATE)) - 1)/2 ;
-    UCSR0A &= ~(1 << U2X0); // baud doubler off  - Only needed on Uno XXX
-  #else
-    uint16_t UBRR0_value = ((F_CPU / (4L * BAUD_RATE)) - 1)/2;
-    UCSR0A |= (1 << U2X0);  // baud doubler on for high baud rates, i.e. 115200
-  #endif
-  UBRR0H = UBRR0_value >> 8;
-  UBRR0L = UBRR0_value;
-            
-  // enable rx and tx
-  UCSR0B |= 1<<RXEN0;
-  UCSR0B |= 1<<TXEN0;
-	
-  // enable interrupt on complete reception of a byte
-  UCSR0B |= 1<<RXCIE0;
-	  
-  // defaults to 8-bit, no parity, 1 stop bit
+#if BAUD > 38401
+	UCSR0A = MASK(U2X0);
+	UBRR0 = (((F_CPU / 8) / BAUD) - 0.5);
+#else
+	UCSR0A = 0;
+	UBRR0 = (((F_CPU / 16) / BAUD) - 0.5);
+#endif
+
+	UCSR0B = MASK(RXEN0) | MASK(TXEN0);
+	UCSR0C = MASK(UCSZ01) | MASK(UCSZ00);
+
+	UCSR0B |= MASK(RXCIE0) | MASK(UDRIE0);
 }
 
+/*
+	Interrupts
+*/
 
-// Writes one byte to the TX serial buffer. Called by main program.
-// TODO: Check if we can speed this up for writing strings, rather than single bytes.
-void serial_write(uint8_t data) {
-  // Calculate next head
-  uint8_t next_head = serial_tx_buffer_head + 1;
-  if (next_head == TX_BUFFER_SIZE) { next_head = 0; }
-
-  // Wait until there is space in the buffer
-  while (next_head == serial_tx_buffer_tail) { 
-    // TODO: Restructure st_prep_buffer() calls to be executed here during a long print.    
-    if (sys.rt_exec_state & EXEC_RESET) { return; } // Only check for abort to avoid an endless loop.
-  }
-
-  // Store data and advance head
-  serial_tx_buffer[serial_tx_buffer_head] = data;
-  serial_tx_buffer_head = next_head;
-  
-  // Enable Data Register Empty Interrupt to make sure tx-streaming is running
-  UCSR0B |=  (1 << UDRIE0); 
-}
-
-
-// Data Register Empty Interrupt handler
-ISR(SERIAL_UDRE)
+/// receive interrupt
+///
+/// we have received a character, stuff it in the rx buffer if we can, or drop it if we can't
+// Using the pragma inside the function is incompatible with Arduinos' gcc.
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#ifdef	USART_RX_vect
+ISR(USART_RX_vect)
+#else
+ISR(USART0_RX_vect)
+#endif
 {
-  uint8_t tail = serial_tx_buffer_tail; // Temporary serial_tx_buffer_tail (to optimize for volatile)
-  
-  #ifdef ENABLE_XONXOFF
-    if (flow_ctrl == SEND_XOFF) { 
-      UDR0 = XOFF_CHAR; 
-      flow_ctrl = XOFF_SENT; 
-    } else if (flow_ctrl == SEND_XON) { 
-      UDR0 = XON_CHAR; 
-      flow_ctrl = XON_SENT; 
-    } else
-  #endif
-  { 
-    // Send a byte from the buffer	
-    UDR0 = serial_tx_buffer[tail];
-  
-    // Update tail position
-    tail++;
-    if (tail == TX_BUFFER_SIZE) { tail = 0; }
-  
-    serial_tx_buffer_tail = tail;
-  }
-  
-  // Turn off Data Register Empty Interrupt to stop tx-streaming if this concludes the transfer
-  if (tail == serial_tx_buffer_head) { UCSR0B &= ~(1 << UDRIE0); }
+	if (buf_canwrite(rx))
+		buf_push(rx, UDR0);
+	else {
+    // Not reading the character makes the interrupt logic to swamp us with
+    // retries, so better read it and throw it away.
+    // #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+		uint8_t trash;
+    // #pragma GCC diagnostic pop
+
+		trash = UDR0;
+	}
+
+	#ifdef	XONXOFF
+	if (flowflags & FLOWFLAG_STATE_XON && buf_canwrite(rx) <= 16) {
+		// the buffer has only 16 free characters left, so send an XOFF
+		// more characters might come in until the XOFF takes effect
+		flowflags = FLOWFLAG_SEND_XOFF | FLOWFLAG_STATE_XON;
+		// enable TX interrupt so we can send this character
+		UCSR0B |= MASK(UDRIE0);
+	}
+	#endif
+}
+#pragma GCC diagnostic pop
+
+/// transmit buffer ready interrupt
+///
+/// provide the next character to transmit if we can, otherwise disable this interrupt
+#ifdef	USART_UDRE_vect
+ISR(USART_UDRE_vect)
+#else
+ISR(USART0_UDRE_vect)
+#endif
+{
+	#ifdef	XONXOFF
+	if (flowflags & FLOWFLAG_SEND_XON) {
+		UDR0 = ASCII_XON;
+		flowflags = FLOWFLAG_STATE_XON;
+	}
+	else if (flowflags & FLOWFLAG_SEND_XOFF) {
+		UDR0 = ASCII_XOFF;
+		flowflags = FLOWFLAG_STATE_XOFF;
+	}
+	else
+	#endif
+	if (buf_canread(tx))
+		buf_pop(tx, UDR0);
+	else
+		UCSR0B &= ~MASK(UDRIE0);
 }
 
+/*
+	Read
+*/
+void serial_reset_read_buffer()
+{
+	rxtail=rxhead;
+}
 
-// Fetches the first byte in the serial read buffer. Called by main program.
+/// check how many characters can be read
+uint8_t serial_get_rx_buffer_count()
+{
+	return buf_canread(rx);
+}
+
+/// check how many characters in write
+uint8_t serial_get_tx_buffer_count()
+{
+	return buf_canread(tx);
+}
+
+/// read one character
 uint8_t serial_read()
 {
-  uint8_t tail = serial_rx_buffer_tail; // Temporary serial_rx_buffer_tail (to optimize for volatile)
-  if (serial_rx_buffer_head == tail) {
-    return SERIAL_NO_DATA;
-  } else {
-    uint8_t data = serial_rx_buffer[tail];
-    
-    tail++;
-    if (tail == RX_BUFFER_SIZE) { tail = 0; }
-    serial_rx_buffer_tail = tail;
+	uint8_t c = 0;
 
-    #ifdef ENABLE_XONXOFF
-      if ((serial_get_rx_buffer_count() < RX_BUFFER_LOW) && flow_ctrl == XOFF_SENT) { 
-        flow_ctrl = SEND_XON;
-        UCSR0B |=  (1 << UDRIE0); // Force TX
-      }
-    #endif
-    
-    return data;
-  }
+	// it's imperative that we check, because if the buffer is empty and we pop, we'll go through the whole buffer again
+	if (buf_canread(rx))
+		buf_pop(rx, c);
+
+	#ifdef	XONXOFF
+	if ((flowflags & FLOWFLAG_STATE_XON) == 0 && buf_canread(rx) <= 16) {
+		// the buffer has (BUFSIZE - 16) free characters again, so send an XON
+		flowflags = FLOWFLAG_SEND_XON;
+		UCSR0B |= MASK(UDRIE0);
+	}
+	#endif
+
+	return c;
 }
 
+/*
+	Write
+*/
 
-ISR(SERIAL_RX)
+/// send one character
+void serial_write(uint8_t data)
 {
-  uint8_t data = UDR0;
-  uint8_t next_head;
-  
-  // Pick off realtime command characters directly from the serial stream. These characters are
-  // not passed into the buffer, but these set system state flag bits for realtime execution.
-  switch (data) {
-    case CMD_STATUS_REPORT: bit_true_atomic(sys.rt_exec_state, EXEC_STATUS_REPORT); break; // Set as true
-    case CMD_CYCLE_START:   bit_true_atomic(sys.rt_exec_state, EXEC_CYCLE_START); break; // Set as true
-    case CMD_FEED_HOLD:     bit_true_atomic(sys.rt_exec_state, EXEC_FEED_HOLD); break; // Set as true
-    case CMD_SAFETY_DOOR:   bit_true_atomic(sys.rt_exec_state, EXEC_SAFETY_DOOR); break; // Set as true
-    case CMD_RESET:         mc_reset(); break; // Call motion control reset routine.
-    default: // Write character to buffer    
-      next_head = serial_rx_buffer_head + 1;
-      if (next_head == RX_BUFFER_SIZE) { next_head = 0; }
-    
-      // Write data to buffer unless it is full.
-      if (next_head != serial_rx_buffer_tail) {
-        serial_rx_buffer[serial_rx_buffer_head] = data;
-        serial_rx_buffer_head = next_head;    
-        
-        #ifdef ENABLE_XONXOFF
-          if ((serial_get_rx_buffer_count() >= RX_BUFFER_FULL) && flow_ctrl == XON_SENT) {
-            flow_ctrl = SEND_XOFF;
-            UCSR0B |=  (1 << UDRIE0); // Force TX
-          } 
-        #endif
-        
-      }
-      //TODO: else alarm on overflow?
-  }
+	// check if interrupts are enabled
+	if (SREG & MASK(SREG_I)) {
+		// if they are, we should be ok to block since the tx buffer is emptied from an interrupt
+		for (;buf_canwrite(tx) == 0;);
+		buf_push(tx, data);
+	}
+	else {
+		// interrupts are disabled- maybe we're in one?
+		// anyway, instead of blocking, only write if we have room
+		if (buf_canwrite(tx))
+			buf_push(tx, data);
+	}
+	// enable TX interrupt so we can send this character
+	UCSR0B |= MASK(UDRIE0);
+}
+#endif /* USB_SERIAL */
+
+/// send a whole block
+void serial_writeblock(void *data, int datalen)
+{
+	int i;
+
+	for (i = 0; i < datalen; i++)
+		serial_write(((uint8_t *) data)[i]);
 }
 
-
-void serial_reset_read_buffer() 
+/// send a string- look for null byte instead of expecting a length
+void serial_writestr(uint8_t *data)
 {
-  serial_rx_buffer_tail = serial_rx_buffer_head;
+	uint8_t i = 0, r;
+	// yes, this is *supposed* to be assignment rather than comparison, so we break when r is assigned zero
+	while ((r = data[i++]))
+		serial_write(r);
+}
 
-  #ifdef ENABLE_XONXOFF
-    flow_ctrl = XON_SENT;
-  #endif
+/**
+	Write block from FLASH
+
+	Extensions to output flash memory pointers. This prevents the data to
+	become part of the .data segment instead of the .code segment. That means
+	less memory is consumed for multi-character writes.
+
+	For single character writes (i.e. '\n' instead of "\n"), using
+	serial_writechar() directly is the better choice.
+*/
+void serial_writeblock_P(PGM_P data_P, int datalen)
+{
+	int i;
+
+	for (i = 0; i < datalen; i++)
+		serial_write(pgm_read_byte(&data_P[i]));
+}
+
+/// Write string from FLASH
+void serial_writestr_P(PGM_P data_P)
+{
+	uint8_t r, i = 0;
+	// yes, this is *supposed* to be assignment rather than comparison, so we break when r is assigned zero
+	while ((r = pgm_read_byte(&data_P[i++])))
+		serial_write(r);
 }
